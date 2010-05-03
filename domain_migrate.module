@@ -1,0 +1,455 @@
+<?php
+
+// A module used to convert books to their own domain 
+
+/**
+ * Implementation of hook_menu().
+ */
+ 
+function domain_migrate_menu() {
+  $items = array();
+  $admin = user_access('administer domains');
+  $items['admin/build/domain/migrate'] = array(
+    'title' => 'Migrate nodes to domain',
+    'access arguments' => array('administer domains'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('domain_migrate_form'),
+    'description' => 'Settings for the Domain Migrate module.',
+    'file' => 'domain_migrate.admin.inc',
+  );
+  $items['admin/build/domain/migrate/migrate'] = array(
+    'title' => 'Migrate nodes to domain',
+    'access arguments' => array('administer domains'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('domain_migrate_form'),
+    'weight' => -10,
+    'file' => 'domain_migrate.admin.inc',
+  );
+  
+  if (module_exists('book')) {
+    $items['admin/build/domain/migrate/generate-book'] = array(
+      'title' => 'Generate book migration file',
+      'access arguments' => array('administer domains'),
+      'type' => MENU_LOCAL_TASK,
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('domain_migrate_generate_book_form'),
+      'weight' => -9,
+      'file' => 'domain_migrate.admin.inc',      
+    );
+  }
+  
+  if (module_exists('taxonomy')) {
+    $items['admin/build/domain/migrate/generate-taxonomy'] = array(
+      'title' => 'Generate taxonomy migration file',
+      'access arguments' => array('administer domains'),
+      'type' => MENU_LOCAL_TASK,
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('domain_migrate_generate_taxonomy_form'),
+      'weight' => -8,
+      'file' => 'domain_migrate.admin.inc',      
+    );
+  }  
+    
+  $items['admin/build/domain/migrate/settings'] = array(
+    'title' => 'Migration settings',
+    'access arguments' => array('administer domains'),
+    'type' => MENU_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('domain_migrate_settings_form'),
+    'weight' => -7,
+    'file' => 'domain_migrate.admin.inc',    
+  );
+  return $items;
+}
+ 
+ 
+/**
+ * This is where the heavy lifting gets done - creation of domains, 
+ * assigning nodes to domains, dealing with users, languages and aliases
+ */
+ 
+function domain_migrate_build_domains($subdomains, $is_book) {
+   
+  $maindomain = $_SERVER["SERVER_NAME"];
+  $domainroot = substr($maindomain, strpos($maindomain, '.'));
+  
+  drupal_set_message('Book is '. $is_book);
+  
+  // Initialise strings to write .htaccess rules
+  $htstring0 = $htstring1 = $htstring2 = $htstring3 = '';
+  
+  foreach ($subdomains as $subdomain) {
+    
+    $settings = array();
+    
+    if ($is_book) {
+      $top_node = node_load($subdomain['bid']);
+    }
+      
+    /* Creating new domains */
+    
+    $sd = $subdomain['domain'] . $domainroot; 
+    $domain = domain_migrate_domain_from_subdomain($sd);
+    if (!empty($domain)) {
+      // Check that another domain doesnt have the same sitename, if it does we will
+      // add suffix to this country name to ensure uniqueness
+      if (domain_migrate_unique_domain_from_sitename($subdomain['sitename'], $sd)) {
+
+        $i = 2;
+        while (domain_migrate_unique_domain_from_sitename($subdomain['sitename']. ' ' . $i, $sd)) {
+          $i++;
+        }
+        $domain->sitename = $subdomain['sitename']. ' ' . $i;
+        
+      } else {
+        // Updating domain sitename only
+        $domain->sitename = $subdomain['sitename'];
+      }
+      drupal_write_record('domain', $domain, array('domain_id'));  
+     
+    } else {
+      $domain = domain_migrate_domain_from_sitename($subdomain['sitename']);     
+      // If sitename exists, update subdomain only
+      if (!empty($domain)) {
+        $domain->subdomain = $sd;
+        drupal_write_record('domain', $domain, array('domain_id'));
+        
+      } else {
+        // Neither subdomain nor sitename exists, entering new domain record
+        $domain->subdomain = $sd;
+        $domain->sitename = $subdomain['sitename'];
+        drupal_write_record('domain', $domain);
+      }
+    }  
+    
+
+    $domain_id = $domain->domain_id;
+    drupal_set_message('New domain ID:'. $domain_id);
+    
+    /* Creating language if necessary and assigning it to front page */
+    
+    $handle_language= FALSE;   
+    $assign_language = variable_get('domain_migrate_assign_language', 'no'); 
+    $default_language = language_default();
+    
+    switch ($assign_language) {
+           
+      case 'book':
+        if ($is_book) {
+          $domain_language = $top_node->language;
+        }
+        break;         
+      
+      case 'subdomain':
+        $domain_language = $subdomain['domain'];
+        $language_name = ucwords($subdomain['domain']);
+        $handle_language = TRUE;
+        break;
+     
+      case 'private':
+        // Create language name consistent with Google RFC 4646, using domain id
+        // Private language name is of form 'Book Language (Domain name)' 
+        // Use site default language if we can't get book language   
+        if ($is_book && $top_node->language) {    
+          $book_language = $top_node->language;
+        }
+        else {
+          $book_language = $default_language->language;    
+        }              
+        $domain_language = $book_language.'-x-'. $domain_id;
+        $language_name = locale_language_name($book_language).' ('. $subdomain['sitename'].')';
+        $handle_language = TRUE;
+        break;              
+    }
+    
+    if ($handle_language) {          
+      $identical_languages = domain_migrate_language_from_domain($domain_language);       
+      if ($identical_languages == 0) {
+        $language = new stdClass; 
+        // Note that language domain has http(s):// in front of it 
+        $language->language = $domain_language;
+        $language->name = $language_name;
+        $language->native = $language_name;
+        $language->enabled = 1;
+        $language->domain = $domain->scheme. '://' .$sd;       
+        drupal_write_record('languages', $language);    
+      }
+    } 
+    
+    if ($assign_language != 'no') {
+      //Set language as domain language
+      $settings['language_default'] = $language->language;
+    }  
+       
+    /* Creating and assigning menus for domain */   
+    $menus = variable_get('domain_migrate_create_menus', array());
+    
+    foreach ($menus as $key => $value) {
+      
+      if ($value) {
+        $menu = domain_migrate_create_menu($key, $subdomain['domain'], $subdomain['sitename']);
+      
+        switch ($key) {
+        
+         case 'primary':
+           $settings['menu_primary_links_source'] = $menu['menu_name'];
+           break;
+       
+         case 'secondary':;  
+           $settings['menu_secondary_links_source'] = $menu['menu_name'];
+           break;
+       
+         case 'navigation': 
+           $settings['menu_default_node_menu'] = $menu['menu_name'];
+           break;
+        
+        }   
+      }
+    }  
+          
+    /* Assigning author of top book node to the selected role on domain */
+    
+    $assigned_roles = variable_get('domain_migrate_user_role', array('user'));
+    
+    if (!empty($assigned_roles) && $is_book) {
+      $domain_editor = new stdClass;
+      $domain_editor->uid = $top_node->uid;
+      $domain_editor->domain_id = $domain_id;
+      drupal_set_message("Assigned user ". $top_node->uid. " to domain ". $domain_id  );      
+      drupal_write_record('domain_editor', $domain_editor); 
+      
+      if ($top_node->uid != 0) {
+        
+        $result = db_query("SELECT uid, rid FROM {users_roles} WHERE uid = %d", $top_node->uid);
+        $existing_user_roles = array();
+        while ($obj = db_fetch_object($result)) {
+             $existing_user_roles[] = $obj->rid;
+        }  
+        
+        //$account = user_load(array('uid' => (int)$top_node->uid));
+      
+        foreach ($assigned_roles as $rid => $value) {
+          drupal_set_message("Assigned role key ". $rid. " value ". $value);
+          if ($value > 3 && !in_array($rid, $existing_user_roles)) {
+            
+            $user_role = new stdClass;
+            $user_role->uid = $top_node->uid;
+            $user_role->rid = $rid;
+            drupal_write_record('users_roles', $user_role);
+            // Skip adding the role to the user if they already have it.
+            //if ($account !== FALSE && !isset($account->roles[$rid])) {
+              //$roles = $account->roles + array($rid => );
+              //user_save($account, array('roles' => $roles));
+            drupal_set_message("Assigned user ". $account->uid. " to role ". $rid);
+            //}
+          }   
+        }  
+      }       
+    }  
+          
+    /* Assigning all nodes on book/taxonomy to domain, changing language and alias if necessary */ 
+    
+    $assign_language_nodes = variable_get('domain_migrate_language_nodes', FALSE);
+    
+    if ($is_book) {    
+      $bookfrontpage = domain_migrate_bookalias('node/'.(int)$subdomain['bid']);  
+      $oldfrontpage = $bookfrontpage->dst;
+      $alter_path = variable_get('domain_migrate_alter_path', FALSE);
+      $result = db_query("SELECT nid FROM {book} WHERE bid = %d", (int)$subdomain['bid']);
+    }
+    else {
+      $result = db_query("SELECT nid FROM {term_node} WHERE tid = %d", (int)$subdomain['tid']);
+    }    
+       
+    while ($domain_node = db_fetch_object($result)) {
+      
+      if (variable_get('domain_migrate_override grants', TRUE)) {
+        db_query("DELETE FROM {domain_access} WHERE nid = %d AND realm='domain_id'", $domain_node->nid);
+      }  
+ 
+      $domain_access = new stdClass;
+      $domain_access->nid = $domain_node->nid;
+      $domain_access->gid = $domain_id;
+      $domain_access->realm = 'domain_id'; 
+      drupal_write_record('domain_access', $domain_access); 
+ 
+    
+      if ($assign_language_nodes || $alter_path) {
+        $alias = domain_migrate_bookalias('node/'.$domain_node->nid); 
+      
+        if ($alter_path) {
+          if ($alias->dst == $bookfrontpage->dst) { 
+              $bookfrontpage->dst = $alias->dst = 'main-'.$subdomain['domain']; 
+          }  
+          else {
+            $sd_pos = strpos($alias->dst, $oldfrontpage);           
+            if($sd_pos === 0) {
+              $alias->dst = substr($alias->dst, strlen($oldfrontpage)+1); 
+            }         
+          }  
+        }   
+         
+        if ($assign_language_nodes) {
+          
+          $alias->language = $domain_language;    
+          $node = node_load($domain_node->nid);        
+          $node->language = $domain_language;
+          drupal_write_record('node',$node,'nid');
+        }    
+        drupal_write_record('url_alias', $alias, array('pid'));             
+      }
+    }  
+    
+    if ($is_book) {  
+      //Set front page of top book as domain front page 
+      drupal_set_message("Setting domain front page to ". $bookfrontpage->dst." for domain" . $domain_id);
+      $settings['site_frontpage'] = $bookfrontpage->dst;
+    }  
+    
+    /* Write domain-specific settings to database. First get the current settings for this domain, if any. */
+    if( module_exists('domain_conf')) { 
+    
+      $domain_conf = new stdClass;
+      $domain_conf->domain_id = $domain_id;
+      $orig_settings = domain_unserialize(db_result(db_query("SELECT settings FROM {domain_conf} WHERE domain_id = %d", $domain_id)));
+    
+      // If settings are found for this domain, update them.
+      if (!empty($orig_settings)) {
+         $settings = array_merge($orig_settings, $settings);
+         $domain_conf->settings = serialize($settings);
+         drupal_write_record('domain_conf', $domain_conf, array('domain_id')); 
+      }
+      else {
+        $domain_conf->settings = serialize($settings);
+        drupal_write_record('domain_conf', $domain_conf); 
+      }
+    
+      $v1 = domain_conf_variable_get($domain_id, 'site_frontpage');
+      $v2 = domain_conf_variable_get($domain_id, 'language_default');
+      drupal_set_message("Frontpage: ". $v1 . " Language: " . $v2);
+    }
+    $redirect = variable_get('domain_migrate_htaccess_redirect', FALSE);
+    
+   if ($is_book && $redirect && $alter_path) {
+
+      // Create .htaccess strings for redirects      
+      $htstring0 .= 'RedirectMatch permanent ^/'.$oldfrontpage.'/(.*)$ '. $domain->scheme .'://'.$sd.'/$1'."\r\n";
+      $htstring1 .= 'RedirectMatch permanent ^/'.$oldfrontpage.'$ '. $domain->scheme .'://'.$sd."\r\n";
+      $htstring2 .= '  RewriteCond %{REQUEST_URI} !^/'.$oldfrontpage.'/ [NC]'."\r\n";
+      $htstring3 .= '  RewriteCond %{REQUEST_URI} !^/'.$oldfrontpage.'$ [NC]'."\r\n";
+    } 
+    
+    $block = new stdClass;
+    $block->domain_id = $domain_id;
+    $block->module = 'domain_admin_helper';
+    $block->delta = 0;
+    $block->region = right;
+    $block->realm = 'domain_id';
+    $block->weight = -10;
+    drupal_write_record('domain_blocks', $block);
+  
+    $block->module = 'book';
+    $block->weight = -8;  
+    drupal_write_record('domain_blocks', $block);                           
+  }   
+  
+  
+      
+  // updating language_count variable
+  $count = db_result(db_query('SELECT COUNT(*) FROM {languages} WHERE enabled = 1'));
+  variable_set('language_count', $count);  
+  
+  // Write the htaccess strings to file
+  
+  if ($is_book) {
+    domain_migrate_htaccesswrite($htstring0, $htstring1, $htstring2, $htstring3); 
+  }
+  
+  drupal_set_message(t('Update is finished. Please rebuild the <a href="@node_access_rebuild">content access permissions</a>.',
+    array('@node_access_rebuild' => url('admin/content/node-settings/rebuild'))));
+} 
+
+/*
+*  The following functions are db queries of the node, domain, language and url_alias tables
+*/
+
+function domain_migrate_domain_from_subdomain($sd) {
+    return db_fetch_object(db_query("SELECT domain_id, subdomain, sitename, scheme, valid FROM {domain} WHERE subdomain = '%s' AND domain_id <> 0", $sd));
+}    
+
+function domain_migrate_unique_domain_from_sitename($sitename, $sd) {
+    return db_fetch_object(db_query("SELECT domain_id, subdomain, sitename, scheme, valid FROM {domain} WHERE sitename = '%s' AND domain_id <> 0 AND subdomain <> '%s'", $sitename, $sd));
+} 
+
+function domain_migrate_domain_from_sitename($sitename) {
+    return db_fetch_object(db_query("SELECT domain_id, subdomain, sitename, scheme, valid FROM {domain} WHERE sitename = '%s' AND domain_id <> 0 AND subdomain <> '%s'", $sitename));
+}  
+
+function domain_migrate_domain_access_from_node($nid) {
+    return db_fetch_object(db_query("SELECT nid, gid, realm FROM {domain_access} WHERE nid = '%d'", $nid));
+}  
+
+function domain_migrate_language_from_domain($language) {
+    return db_result(db_query("SELECT COUNT(*) FROM {languages} WHERE language = '%s'", $language));
+}   
+
+function domain_migrate_bookalias($src) {
+    return db_fetch_object(db_query("SELECT pid, dst, language FROM {url_alias} WHERE src = '%s'", $src));
+}
+
+/*
+*  Create primary, secondary and navigation menus for each domain
+*/ 
+
+function domain_migrate_create_menu($menu_type, $domain, $sitename) {
+
+  $menu = $link = array();
+  $path = 'admin/build/menu-customize/';
+  
+  $menu['menu_name'] = 'menu-'.$menu_type .'-'. $domain;
+  $menu['description'] = $menu_type. ' menu for the ' . $sitename . ' domain';
+  $link['link_title'] = $menu['title'] = $menu_type . ' '. $sitename;
+  $link['link_path'] = $path . $menu['menu_name'];
+  $link['router_path'] = $path .'%';
+  $link['module'] = 'menu';
+  $link['plid'] = db_result(db_query("SELECT mlid FROM {menu_links} WHERE link_path = '%s' AND module = '%s'", 'admin/build/menu', 'system'));
+  menu_link_save($link);
+  drupal_write_record('menu_custom', $menu);
+  
+  return $menu;
+    
+}   
+
+/*
+*  Generates redirection rules wich you can paste into your .htaccess file
+*/ 
+
+function domain_migrate_htaccesswrite($htstring0, $htstring1, $htstring2, $htstring3) {
+  
+  $txtFile = drupal_get_path('module','domain_migrate') . '/htaccess.txt';
+  $fh = fopen($txtFile, 'w');
+   
+  $string1 = "Paste this in after the </ifModule> statement:\r\n\r\n# --- Start Domain Migrate .htaccess rules (pt 1) here --- \r\n\r\n";
+  fwrite($fh, $string1);
+  fwrite($fh, $htstring0);
+  fwrite($fh, "\r\n");
+  fwrite($fh, $htstring1);
+  $string2 = "\r\n\r\nPaste this in after the 'RewriteCond %{REQUEST_URI} !=/favicon.ico' statement:\r\n\r\n# --- Start Domain Migrate .htaccess rules (pt 2) here --- \r\n\r\n";
+  fwrite($fh, $string2);  
+  fwrite($fh, $htstring2);
+  fwrite($fh, "\r\n");
+  fwrite($fh, $htstring3);  
+  
+  drupal_set_message('.htaccess redirect rules have been written to '.$txtFile);
+  fclose($fh);  
+  
+}  
+
+
+
+
+
+
+    
+

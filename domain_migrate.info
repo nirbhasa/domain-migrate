@@ -1,0 +1,7 @@
+; $Id$
+name = Domain Migration
+description = "A module used to move nodes in an existing Drupal site to their own domain."
+version = "6.x-1.0beta1"
+package = 'Domain Access' 
+core = "6.x"
+dependencies[] = domain
